@@ -6,12 +6,13 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
 #SBATCH --time=24:00:00
-#SBATCH --array=0-2
+#SBATCH --array=0-0
 #SBATCH --output=logs/train_seed%a_%j.out
 #SBATCH --error=logs/train_seed%a_%j.err
 
-# Trains the model_comparison_experiment models: SD1, 20x10, one seed per
-# array task (0/1/2). Submit with: sbatch run_train.sh
+# Trains the 1-layer_experiment models: SD1, 20x10. Only seed 0 for now
+# (array range can be widened back to 0-2 later to add seeds 1/2).
+# Submit with: sbatch run_train.sh
 
 set -euo pipefail
 
@@ -34,13 +35,9 @@ N_M=10
 DATA_SOURCE=SD1
 MAX_UPDATES=1000
 
-# scheduling-aware graph coarsening (SAGC)
-POOLING_TYPE=sagc
-POOLING_RATIO=2.0
-K_MODE=jobs
-RUN_TAG=sagc
+RUN_TAG=1-layer_experiment
 
-echo "=== Training seed=${SEED} data_source=${DATA_SOURCE} size=${N_J}x${N_M} pooling=${POOLING_TYPE} ratio=${POOLING_RATIO} k_mode=${K_MODE} ==="
+echo "=== Training seed=${SEED} data_source=${DATA_SOURCE} size=${N_J}x${N_M} run_tag=${RUN_TAG} ==="
 srun nvidia-smi || true
 
 exec srun "${PYTHON}" train.py \
@@ -50,7 +47,4 @@ exec srun "${PYTHON}" train.py \
     --max_updates "${MAX_UPDATES}" \
     --seed_train "${SEED}" \
     --model_suffix "${RUN_TAG}_seed${SEED}" \
-    --pooling_type "${POOLING_TYPE}" \
-    --pooling_ratio "${POOLING_RATIO}" \
-    --k_mode "${K_MODE}" \
     --device cuda

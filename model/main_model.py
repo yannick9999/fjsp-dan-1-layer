@@ -1,7 +1,6 @@
 from common_utils import nonzero_averaging
 from model.attention_layer import *
 from model.sub_layers import *
-from model.sagc_pool import SAGCPoolDAN
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,83 +9,43 @@ import torch.nn.functional as F
 class DualAttentionNetwork(nn.Module):
     def __init__(self, config):
         """
-            The implementation of dual attention network (DAN)
+            The implementation of dual attention network (DAN), reduced to a
+            single DAN layer: raw features go directly into one attention
+            block per branch, with heads averaged (not concatenated) to
+            produce the final embeddings directly.
         :param config: a package of parameters
         """
         super(DualAttentionNetwork, self).__init__()
 
         self.fea_j_input_dim = config.fea_j_input_dim
         self.fea_m_input_dim = config.fea_m_input_dim
-        self.output_dim_per_layer = config.layer_fea_output_dim
-        self.num_heads_OAB = config.num_heads_OAB
-        self.num_heads_MAB = config.num_heads_MAB
-        self.last_layer_activate = nn.ELU()
-
-        self.num_dan_layers = len(self.num_heads_OAB)
-        assert len(config.num_heads_MAB) == self.num_dan_layers
-        assert len(self.output_dim_per_layer) == self.num_dan_layers
+        self.output_dim = config.layer_fea_output_dim[-1]
+        self.num_heads_OAB = config.num_heads_OAB[-1]
+        self.num_heads_MAB = config.num_heads_MAB[-1]
         self.alpha = 0.2
         self.leaky_relu = nn.LeakyReLU(self.alpha)
         self.dropout_prob = config.dropout_prob
 
-        num_heads_OAB_per_layer = [1] + self.num_heads_OAB
-        num_heads_MAB_per_layer = [1] + self.num_heads_MAB
+        self.op_attention_block = MultiHeadOpAttnBlock(
+            input_dim=self.fea_j_input_dim,
+            num_heads=self.num_heads_OAB,
+            output_dim=self.output_dim,
+            concat=False,
+            activation=nn.ELU(),
+            dropout_prob=self.dropout_prob
+        )
 
-        # mid_dim = [self.embedding_output_dim] * (self.num_dan_layers - 1)
-        mid_dim = self.output_dim_per_layer[:-1]
+        self.mch_attention_block = MultiHeadMchAttnBlock(
+            node_input_dim=self.fea_m_input_dim,
+            edge_input_dim=self.fea_j_input_dim,
+            num_heads=self.num_heads_MAB,
+            output_dim=self.output_dim,
+            concat=False,
+            activation=nn.ELU(),
+            dropout_prob=self.dropout_prob
+        )
 
-        j_input_dim_per_layer = [self.fea_j_input_dim] + mid_dim
-
-        m_input_dim_per_layer = [self.fea_m_input_dim] + mid_dim
-
-        self.op_attention_blocks = torch.nn.ModuleList()
-        self.mch_attention_blocks = torch.nn.ModuleList()
-
-        for i in range(self.num_dan_layers):
-            self.op_attention_blocks.append(
-                MultiHeadOpAttnBlock(
-                    input_dim=num_heads_OAB_per_layer[i] * j_input_dim_per_layer[i],
-                    num_heads=self.num_heads_OAB[i],
-                    output_dim=self.output_dim_per_layer[i],
-                    concat=True if i < self.num_dan_layers - 1 else False,
-                    activation=nn.ELU() if i < self.num_dan_layers - 1 else self.last_layer_activate,
-                    dropout_prob=self.dropout_prob
-                )
-            )
-
-        for i in range(self.num_dan_layers):
-            self.mch_attention_blocks.append(
-                MultiHeadMchAttnBlock(
-                    node_input_dim=num_heads_MAB_per_layer[i] * m_input_dim_per_layer[i],
-                    edge_input_dim=num_heads_OAB_per_layer[i] * j_input_dim_per_layer[i],
-                    num_heads=self.num_heads_MAB[i],
-                    output_dim=self.output_dim_per_layer[i],
-                    concat=True if i < self.num_dan_layers - 1 else False,
-                    activation=nn.ELU() if i < self.num_dan_layers - 1 else self.last_layer_activate,
-                    dropout_prob=self.dropout_prob
-                )
-            )
-
-        # SAGC pooling, inserted between DAN layer 0 and layer 1.
-        # 'nopooling' keeps the original DAN untouched.
-        self.pooling_type = getattr(config, 'pooling_type', 'nopooling')
-        self.sagc = None
-        if self.pooling_type == 'sagc':
-            assert self.num_dan_layers >= 2, \
-                "SAGC needs at least two DAN layers (pooling sits between layer 0 and 1)"
-            # embedding dim after layer 0: heads are concatenated on all
-            # layers except the last one
-            if self.num_dan_layers > 1:
-                embed_dim_after_l0 = self.num_heads_OAB[0] * self.output_dim_per_layer[0]
-            else:
-                embed_dim_after_l0 = self.output_dim_per_layer[0]
-            self.sagc = SAGCPoolDAN(embed_dim=embed_dim_after_l0,
-                                    ope_feat_dim=self.fea_j_input_dim,
-                                    ratio=getattr(config, 'pooling_ratio', 0.6),
-                                    k_mode=getattr(config, 'k_mode', 'ops'))
-
-    def forward(self, fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx,
-                opes_appertain=None, deleted_op_nodes=None, eligible_opes=None):
+    def forward(self, fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx):
         """
         :param candidate: the index of candidates  [sz_b, J]
         :param fea_j: input operation feature vectors with shape [sz_b, N, 8]
@@ -97,48 +56,30 @@ class DualAttentionNetwork(nn.Module):
         :param comp_idx: a tensor with shape [sz_b, M, M, J] used for computing T_E
                     the value of comp_idx[i, k, q, j] (any i) means whether
                     machine $M_k$ and $M_q$ are competing for candidate[i,j]
-        :param opes_appertain: job index per operation [sz_b, N], required for SAGC
-        :param deleted_op_nodes: bool [sz_b, N], completed/padding nodes, required for SAGC
-        :param eligible_opes: bool [sz_b, N], protected candidate nodes, required for SAGC
         :return:
-            fea_j.shape = [sz_b, k, output_dim] (k = N without pooling)
+            fea_j.shape = [sz_b, N, output_dim]
             fea_m.shape = [sz_b, M, output_dim]
             fea_j_global.shape = [sz_b, output_dim]
             fea_m_global.shape = [sz_b, output_dim]
-            candidate_out: candidate indices valid for fea_j
-                           (remapped to pooled positions when SAGC is active)
         """
         sz_b, M, _, J = comp_idx.size()
 
         comp_idx_for_mul = comp_idx.reshape(sz_b, -1, J)
 
-        raw_fea_j = fea_j
-        candidate_out = candidate
+        candidate_idx = candidate.unsqueeze(-1). \
+            repeat(1, 1, fea_j.shape[-1]).type(torch.int64)
 
-        for layer in range(self.num_dan_layers):
-            candidate_idx = candidate_out.unsqueeze(-1). \
-                repeat(1, 1, fea_j.shape[-1]).type(torch.int64)
+        # fea_j_jc: candidate features with shape [sz_b, N, J]
+        fea_j_jc = torch.gather(fea_j, 1, candidate_idx).type(torch.float32)
+        comp_val = torch.matmul(comp_idx_for_mul, fea_j_jc).reshape(sz_b, M, M, -1)
 
-            # fea_j_jc: candidate features with shape [sz_b, N, J]
-            fea_j_jc = torch.gather(fea_j, 1, candidate_idx).type(torch.float32)
-            comp_val_layer = torch.matmul(comp_idx_for_mul,
-                                     fea_j_jc).reshape(sz_b, M, M, -1)
-            fea_j = self.op_attention_blocks[layer](fea_j, op_mask)
-            fea_m = self.mch_attention_blocks[layer](fea_m, mch_mask, comp_val_layer)
-
-            if self.sagc is not None and layer == 0:
-                if opes_appertain is None or deleted_op_nodes is None or eligible_opes is None:
-                    raise ValueError(
-                        "SAGC is enabled but opes_appertain / deleted_op_nodes / "
-                        "eligible_opes were not passed to the model")
-                fea_j, op_mask, candidate_out, _ = self.sagc(
-                    fea_j, raw_fea_j, candidate_out, opes_appertain,
-                    eligible_opes, deleted_op_nodes)
+        fea_j = self.op_attention_block(fea_j, op_mask)
+        fea_m = self.mch_attention_block(fea_m, mch_mask, comp_val)
 
         fea_j_global = nonzero_averaging(fea_j)
         fea_m_global = nonzero_averaging(fea_m)
 
-        return fea_j, fea_m, fea_j_global, fea_m_global, candidate_out
+        return fea_j, fea_m, fea_j_global, fea_m_global
 
 
 class DANIEL(nn.Module):
@@ -177,32 +118,22 @@ class DANIEL(nn.Module):
         :param dynamic_pair_mask: a tensor with shape [sz_b, J, M], used for masking
                             incompatible op-mch pairs
         :param fea_pairs: pair features with shape [sz_b, J, M, 8]
+        :param opes_appertain: unused (kept for call-site compatibility; was
+                            only needed by SAGC pooling, which this single-layer
+                            encoder no longer has)
+        :param deleted_op_nodes: unused, see opes_appertain
         :return:
             pi: scheduling policy with shape [sz_b, J*M]
             v: the value of state with shape [sz_b, 1]
         """
 
-        # Eligible operations: candidates of jobs that currently have at
-        # least one valid (job, machine) pair. Exactly these candidate
-        # features enter comp_val via comp_idx, so exactly these nodes are
-        # protected from pooling.
-        eligible_opes = None
-        if opes_appertain is not None:
-            N = fea_j.size(1)
-            job_eligible = (~dynamic_pair_mask.bool()).any(dim=-1)  # [sz_b, J]
-            eligible_opes = torch.zeros(fea_j.size(0), N, dtype=torch.bool,
-                                        device=fea_j.device)
-            eligible_opes.scatter_(1, candidate.long(), job_eligible)
-
-        fea_j, fea_m, fea_j_global, fea_m_global, candidate_used = self.feature_exact(
-            fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx,
-            opes_appertain=opes_appertain, deleted_op_nodes=deleted_op_nodes,
-            eligible_opes=eligible_opes)
+        fea_j, fea_m, fea_j_global, fea_m_global = self.feature_exact(
+            fea_j, op_mask, candidate, fea_m, mch_mask, comp_idx)
         sz_b, M, _, J = comp_idx.size()
         d = fea_j.size(-1)
 
         # collect the input of decision-making network
-        candidate_idx = candidate_used.unsqueeze(-1).repeat(1, 1, d)
+        candidate_idx = candidate.unsqueeze(-1).repeat(1, 1, d)
         candidate_idx = candidate_idx.type(torch.int64)
 
         Fea_j_JC = torch.gather(fea_j, 1, candidate_idx)

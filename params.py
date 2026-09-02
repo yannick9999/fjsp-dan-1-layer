@@ -73,9 +73,9 @@ parser.add_argument('--fea_m_input_dim', type=int, default=8, help='Dimension of
 
 parser.add_argument('--dropout_prob', type=float, default=0.0, help='Dropout rate (1 - keep probability).')
 
-parser.add_argument('--num_heads_OAB', nargs='+', type=int, default=[4, 4],
+parser.add_argument('--num_heads_OAB', nargs='+', type=int, default=[4],
                     help='Number of attention head of operation message attention block')
-parser.add_argument('--num_heads_MAB', nargs='+', type=int, default=[4, 4],
+parser.add_argument('--num_heads_MAB', nargs='+', type=int, default=[4],
                     help='Number of attention head of machine message attention block')
 parser.add_argument('--pooling_type', type=str, default='nopooling',
                     choices=['nopooling', 'sagc'],
@@ -84,8 +84,8 @@ parser.add_argument('--pooling_ratio', type=float, default=0.6,
                     help='pooling ratio, interpretation depends on k_mode')
 parser.add_argument('--k_mode', type=str, default='ops', choices=['ops', 'jobs'],
                     help="'ops': k = ratio * N, 'jobs': k = ratio * num_jobs")
-parser.add_argument('--layer_fea_output_dim', nargs='+', type=int, default=[32, 8],
-                    help='Output dimension of the DAN layers')
+parser.add_argument('--layer_fea_output_dim', nargs='+', type=int, default=[8],
+                    help='Output dimension of the DAN layer')
 
 parser.add_argument('--num_mlp_layers_actor', type=int, default=3, help='Number of layers in Actor network')
 parser.add_argument('--hidden_dim_actor', type=int, default=64, help='Hidden dimension of Actor network')
